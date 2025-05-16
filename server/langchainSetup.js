@@ -11,3 +11,5 @@ const model = new ChatOpenAI({
 }).bindTools([weatherTool]);
 
 export default model;
+
+

@@ -2,7 +2,17 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import model from "./langchainSetup.js";
-import { ToolMessage, HumanMessage } from "@langchain/core/messages";
+import { weatherTool } from "./tools/weatherTool.js";
+import {
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+} from "@langchain/core/messages";
+import { Readable } from "stream";
+import {
+    saveClothingDocument,
+    loadClothingEmbeddings,
+} from "./embeddings.js";
 
 dotenv.config();
 
@@ -10,15 +20,47 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Endpoint dat AI-antwoord genereert op gebruikersvragen
-app.post("/api/ask", async (req, res) => {
-  const { message } = req.body;
-  console.log("Incoming message:", message);
+let chatHistory = [];
+let userFavorites = null;
 
-  try {
-    // Prompt die GPT instructies geeft om kort en duidelijk kledingadvies te geven
-    const prompt = `
-You are a weather-based assistant.
+app.post("/api/upload-favorites", async (req, res) => {
+    const { favorites } = req.body;
+
+    try {
+        userFavorites = favorites;
+        await saveClothingDocument(favorites);
+        res.json({ status: "ok" });
+    } catch (err) {
+        console.error("Fout bij upload:", err);
+        res.status(500).json({ error: "Upload mislukt." });
+    }
+});
+
+app.post("/api/ask", async (req, res) => {
+    const { message } = req.body;
+    console.log("Incoming message:", message);
+
+    try {
+        // Als er geen favorites in geheugen staan, laad ze uit de FAISS database
+        let favoritesText;
+        if (userFavorites) {
+            favoritesText = JSON.stringify(userFavorites, null, 2);
+        } else {
+            const store = await loadClothingEmbeddings();
+            if (store) {
+                const results = await store.similaritySearch("user favorites", 1);
+                favoritesText = results[0]?.pageContent || "(no favorites found)";
+            } else {
+                favoritesText = "(no favorites uploaded)";
+            }
+        }
+
+        const systemPrompt = `
+You are a weather-based clothing assistant.
+
+The user has uploaded a list of their favorite clothing items. Use them to guide your advice. These are the items:
+
+${favoritesText}
 
 When the user asks a question like:
 - "Can I wear shorts in Amsterdam?"
@@ -28,76 +70,65 @@ Your job:
 
 1. Extract the city from the question.
 2. Use the getWeather tool with that city.
-3. Based on the temperature and weather, give a short, decisive answer to the user's question:
+3. Based on the temperature, conditions, and user's favorite items:
    - Say if it's a good idea or not.
    - Mention the temperature and condition briefly.
-   - Be clear and confident.
+   - Prefer clothing from the user's favorites if possible.
 4. Write your answer in the same language the user used (Dutch or English).
 5. Keep it to 1 or 2 sentences max.
-6. Do NOT give full outfits, accessories, or shoe suggestions.
-
-Examples:
-
-Dutch:
-Vraag: "Kan ik een korte broek aan in Amsterdam?"
-Antwoord: "Het is in Amsterdam 14 graden en bewolkt, dus ik zou geen korte broek aanraden."
-
-English:
-Question: "Should I wear a jacket in Rotterdam?"
-Answer: "It's 11°C and windy in Rotterdam, so yes, a jacket is a good idea."
-
-Now answer the following:
-"${message}"
+6. Do NOT suggest clothing that is not in the user's favorites.
 `;
 
-    // Eerste AI-call: antwoord op basis van prompt
-    const firstResponse = await model.invoke(prompt);
-    console.log("First GPT response:", firstResponse);
+        if (chatHistory.length === 0) {
+            chatHistory.push(new SystemMessage(systemPrompt));
+        }
 
-    // Als de AI een tool wil gebruiken (bijv. weer ophalen)
-    if (firstResponse.tool_calls?.length > 0) {
-      const toolCall = firstResponse.tool_calls[0];
-      const args = toolCall.args;
+        chatHistory.push(new HumanMessage(message));
 
-      console.log("GPT tool-call:", toolCall.name, args);
+        const firstResponse = await model.invoke(chatHistory);
 
-      // Controleer of locatie is meegegeven
-      if (!args.location) {
-        return res.json({ reply: "I need a location to check the weather. Please include a city name." });
-      }
+        if (firstResponse.tool_calls?.length > 0) {
+            const toolCall = firstResponse.tool_calls[0];
+            const args = toolCall.args;
 
-      // Importeer de tool en haal weerdata op
-      const { weatherTool } = await import("./tools/weatherTool.js");
-      const toolResult = await weatherTool.func(args);
-      console.log("Tool result:", toolResult);
+            const toolResult = await weatherTool.func(args);
+            chatHistory.push(firstResponse);
+            chatHistory.push(
+                new ToolMessage({
+                    tool_call_id: toolCall.id,
+                    content: toolResult,
+                })
+            );
 
-      // Tweede AI-call met het resultaat van de weerdata
-      const finalResponse = await model.invoke([
-        firstResponse,
-        new ToolMessage({
-          tool_call_id: toolCall.id,
-          content: toolResult,
-        }),
-        new HumanMessage({
-          content: `Based on that weather information, give a clear clothing suggestion.`,
-        }),
-      ]);
+            const finalStream = await model.stream(chatHistory);
+            res.setHeader("Content-Type", "text/plain");
+            const nodeStream = Readable.from(
+                (async function* () {
+                    for await (const chunk of finalStream) {
+                        yield chunk.content || "";
+                    }
+                })()
+            );
+            return nodeStream.pipe(res);
+        }
 
-      console.log("Final GPT response:", finalResponse.content);
-      return res.json({ reply: finalResponse.content });
+        const stream = await model.stream(chatHistory);
+        res.setHeader("Content-Type", "text/plain");
+        const nodeStream = Readable.from(
+            (async function* () {
+                for await (const chunk of stream) {
+                    yield chunk.content || "";
+                }
+            })()
+        );
+        nodeStream.pipe(res);
+    } catch (err) {
+        console.error("Error during streaming:", err);
+        res.status(500).end("Error occurred.");
     }
-
-    // Als geen tool is gebruikt, stuur direct het eerste AI-antwoord terug
-    return res.json({ reply: firstResponse.content || "I wasn't able to generate an answer." });
-
-  } catch (err) {
-    console.error("Error in ask flow:", err);
-    res.status(500).json({ error: "Internal server error." });
-  }
 });
 
-// Start de server op poort 3001
 const PORT = 3001;
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+    console.log(`✅ Server running at http://localhost:${PORT}`);
 });
