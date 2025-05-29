@@ -37,7 +37,7 @@ app.post("/api/upload-favorites", async (req, res) => {
 });
 
 app.post("/api/ask", async (req, res) => {
-    const { message } = req.body;
+    const { message } = req.body; // ophalen van de vraag van de gebruiker
     console.log("Incoming message:", message);
 
     try {
@@ -83,9 +83,9 @@ Your job:
             chatHistory.push(new SystemMessage(systemPrompt));
         }
 
-        chatHistory.push(new HumanMessage(message));
+        chatHistory.push(new HumanMessage(message));// vraag van de gebruiker
 
-        const firstResponse = await model.invoke(chatHistory);
+        const firstResponse = await model.invoke(chatHistory); // antwoord van de AI
 
         if (firstResponse.tool_calls?.length > 0) {
             const toolCall = firstResponse.tool_calls[0];
@@ -100,7 +100,7 @@ Your job:
                 })
             );
 
-            const finalStream = await model.stream(chatHistory);
+            const finalStream = await model.stream(chatHistory); // woord voor woord streaming
             res.setHeader("Content-Type", "text/plain");
             const nodeStream = Readable.from(
                 (async function* () {
